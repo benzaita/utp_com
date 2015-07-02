@@ -18,19 +18,30 @@
 #include <fcntl.h>
 #include <stdlib.h>
 #include <string.h>
-#include <unistd.h>
 #include <sys/stat.h>
 
 #ifdef WIN32
+#include <windows.h>
+#include <devioctl.h>
+#include <ntdddisk.h>
+#include <ntddscsi.h>
 #include <stdio.h>
+#include <stddef.h>
+#include <stdlib.h>
+#include <strsafe.h>
+#include <intsafe.h>
+#define _NTSCSI_USER_MODE_
 #include <scsi.h>
+
+#include "getopt.h"
 
 typedef unsigned char uint8_t;
 typedef unsigned int uint32_t;
 
-#define CLOSE CloseFile
+#define CLOSE CloseHandle
 #define FILE_HANDLE HANDLE
 #else
+#include <unistd.h>
 #include <sys/ioctl.h>
 #include <scsi/sg_lib.h>
 #include <scsi/sg_io_linux.h>
@@ -39,7 +50,7 @@ typedef unsigned int uint32_t;
 #define FILE_HANDLE int
 #endif
 
-#define BUSY_SLEEP           500000
+#define BUSY_SLEEP           500
 #define BUSY_CHECK_COUNT     500
 #define CMD_TIMEOUT          (5 * 60 * 1000)
 #define UTP_CMD_SIZE         0x10
@@ -55,25 +66,31 @@ typedef unsigned int uint32_t;
 #define UTP_REPLY_SIZE 3
 
 int extra_info = 0;
-
-struct __attribute__ (( packed )) utp_cmd
+#ifdef WIN32
+#pragma pack (push , 1)
+struct utp_cmd
 {
 	uint8_t data[UTP_CMD_SIZE];
 };
+#else
+struct __attribute__ (( packed ))utp_cmd
+{
+	uint8_t data[UTP_CMD_SIZE];
+};
+#endif
+
 
 struct utp_cmd poll =
-{
-	.data = {0xf0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0}
-};
+{0xf0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0};
 
 struct utp_cmd exec =
 {
-	.data = {0xf0, 0x1, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0}
+	0xf0, 0x1, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0
 };
 
 struct utp_cmd put =
 {
-	.data = {0xf0, 0x3, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0}
+	0xf0, 0x3, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0
 };
 
 void print_help()
@@ -86,7 +103,7 @@ void print_help()
 	printf("\n\te.g. sudo ./upt_com -d /dev/sdb -c \"$ uname -r\"\n");
 }
 
-int send_cmd(int device_fd, struct utp_cmd *cmd, void *dxferp, int dxferp_len, uint8_t *utp_reply_code)
+int send_cmd(FILE_HANDLE device_fd, struct utp_cmd *cmd, void *dxferp, int dxferp_len, uint8_t *utp_reply_code)
 {
 	int err = 1;
 	int ret;
@@ -96,7 +113,7 @@ int send_cmd(int device_fd, struct utp_cmd *cmd, void *dxferp, int dxferp_len, u
 #ifdef WIN32
 	int junk;
 	int totalBufferLength = sizeof(SCSI_PASS_THROUGH) + SENSE_BUF_SIZE + dxferp_len;
-	SCSI_PASS_THROUGH hdr = (SCSI_PASS_THROUGH*) malloc(totalBufferLength);
+	SCSI_PASS_THROUGH *hdr = (SCSI_PASS_THROUGH*) malloc(totalBufferLength);
 
 	hdr->Length = sizeof(SCSI_PASS_THROUGH);
 	hdr->SenseInfoLength = SENSE_BUF_SIZE;
@@ -105,14 +122,14 @@ int send_cmd(int device_fd, struct utp_cmd *cmd, void *dxferp, int dxferp_len, u
 	hdr->SenseInfoOffset = sizeof(SCSI_PASS_THROUGH);
 	hdr->DataBufferOffset = sizeof(SCSI_PASS_THROUGH) + SENSE_BUF_SIZE;
 
-	memset(hdr->SenseInfoOffset + (void*)hdr, 0, hdr->SenseInfoLength);
-	memcpy(hdr->DataBufferOffset + (void*)hdr, dxferp, hdr->DataTransferLength);
+	memset(hdr->SenseInfoOffset + (char*)hdr, 0, hdr->SenseInfoLength);
+	memcpy(hdr->DataBufferOffset + (char*)hdr, dxferp, hdr->DataTransferLength);
 		
 	hdr->PathId = 0;
 	hdr->TargetId = 1;
 	hdr->Lun = 0;
 	hdr->CdbLength = UTP_CMD_SIZE;
-	hdr->Cdb = (unsigned char *)cmd->data;
+	memcpy(hdr->Cdb, (unsigned char *)cmd->data, UTP_CMD_SIZE);
 	hdr->DataIn = SCSI_IOCTL_DATA_OUT;
 	hdr->TimeOutValue = CMD_TIMEOUT;
 #else
@@ -136,7 +153,7 @@ int send_cmd(int device_fd, struct utp_cmd *cmd, void *dxferp, int dxferp_len, u
 		for (i = 0; i < UTP_CMD_SIZE; i++)
 		{
 #ifdef WIN32
-			printf("Sent data %02d: 0x%02x\n", i, hdr.Cdb[i]);
+			printf("Sent data %02d: 0x%02x\n", i, hdr->Cdb[i]);
 #else
 			printf("Sent data %02d: 0x%02x\n", i, sgio_hdr.cmdp[i]);
 #endif
@@ -195,13 +212,19 @@ int main(int argc, char * argv[])
 {
 	int c;
 	int ret;
-	int file_fd;
+	FILE_HANDLE file_fd;
 	FILE_HANDLE device_fd;
 	struct stat st;
 	char *command = NULL;
 	char *file_name = NULL;
 	char *file_data = NULL;
 	char *device_name = NULL;
+	int data_read;
+	int total_read = 0;
+	struct utp_cmd put_send;
+	int data_written;
+	int i;
+	uint8_t reply;
 
 	opterr = 0;
 
@@ -246,10 +269,14 @@ int main(int argc, char * argv[])
 		}
 
 		// Allocate memory
-		file_data = malloc(st.st_size);
+		file_data = (char*)malloc(st.st_size);
 
 		// Open file
+#ifdef WIN32
+		file_fd = CreateFile(file_name, GENERIC_READ, 0, 0, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, 0);
+#else
 		file_fd = open(file_name, O_RDONLY);
+#endif
 		if (file_fd < 0)
 		{
 			fprintf(stderr, "Error opening file: %s\n", file_name);
@@ -257,18 +284,22 @@ int main(int argc, char * argv[])
 		}
 
 		// Read data
-		int data_read;
-		int total_read = 0;
+		do {
+#ifdef WIN32
+			ReadFile(file_fd, file_data + total_read, st.st_size - total_read, &data_read, 0);
+#else
+			data_read = read(file_fd, file_data + total_read, st.st_size - total_read);
+#endif
+			if (data_read == 0)
+				break;
 
-		while ((data_read = read(file_fd, file_data + total_read, st.st_size - total_read)) > 0)
-		{
 			if (extra_info)
 			{
 				printf("Read from file: %d bytes\n", data_read);
 			}
 
 			total_read += data_read;
-		}
+		} while (1);
 
 		CLOSE(file_fd);
 
@@ -282,7 +313,7 @@ int main(int argc, char * argv[])
 
 	// Open device
 #ifdef WIN32
-	device_fd = CreateFile(device_name, GENERIC_READ, 0, 0, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, 0);
+	device_fd = CreateFile(device_name, GENERIC_READ | GENERIC_WRITE, 0, 0, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, 0);
 #else
 	device_fd = open(device_name, O_RDWR);
 #endif
@@ -307,10 +338,9 @@ int main(int argc, char * argv[])
 		}
 
 		// Send data in put command
-		struct utp_cmd put_send;
 		memcpy(&put_send, &put, sizeof(put_send));
 
-		int data_written = 0;
+		data_written = 0;
 		while (data_written < st.st_size)
 		{
 			int write_size = st.st_size - data_written > MAX_SENT_DATA_SIZE ? MAX_SENT_DATA_SIZE : st.st_size - data_written;
@@ -335,11 +365,14 @@ int main(int argc, char * argv[])
 		}
 
 		// Wait until not busy
-		int i;
-		uint8_t reply = UTP_REPLY_BUSY;
+		reply = UTP_REPLY_BUSY;
 		for (i = 0; i < BUSY_CHECK_COUNT; i++)
 		{
-			usleep(BUSY_SLEEP);
+#ifdef WIN32
+			Sleep(BUSY_SLEEP);
+#else
+			sleep(BUSY_SLEEP);
+#endif
 
 			ret = send_cmd(device_fd, &poll, "", 0, &reply);
 			if (ret)
