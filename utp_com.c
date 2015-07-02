@@ -20,9 +20,24 @@
 #include <string.h>
 #include <unistd.h>
 #include <sys/stat.h>
+
+#ifdef WIN32
+#include <stdio.h>
+#include <scsi.h>
+
+typedef unsigned char uint8_t;
+typedef unsigned int uint32_t;
+
+#define CLOSE CloseFile
+#define FILE_HANDLE HANDLE
+#else
 #include <sys/ioctl.h>
 #include <scsi/sg_lib.h>
 #include <scsi/sg_io_linux.h>
+
+#define CLOSE close
+#define FILE_HANDLE int
+#endif
 
 #define BUSY_SLEEP           500000
 #define BUSY_CHECK_COUNT     500
@@ -73,10 +88,34 @@ void print_help()
 
 int send_cmd(int device_fd, struct utp_cmd *cmd, void *dxferp, int dxferp_len, uint8_t *utp_reply_code)
 {
+	int err = 1;
 	int ret;
 	uint8_t sensebuf[SENSE_BUF_SIZE] = {0};
 
 	// Create sg io header
+#ifdef WIN32
+	int junk;
+	int totalBufferLength = sizeof(SCSI_PASS_THROUGH) + SENSE_BUF_SIZE + dxferp_len;
+	SCSI_PASS_THROUGH hdr = (SCSI_PASS_THROUGH*) malloc(totalBufferLength);
+
+	hdr->Length = sizeof(SCSI_PASS_THROUGH);
+	hdr->SenseInfoLength = SENSE_BUF_SIZE;
+	hdr->DataTransferLength = dxferp_len;
+
+	hdr->SenseInfoOffset = sizeof(SCSI_PASS_THROUGH);
+	hdr->DataBufferOffset = sizeof(SCSI_PASS_THROUGH) + SENSE_BUF_SIZE;
+
+	memset(hdr->SenseInfoOffset + (void*)hdr, 0, hdr->SenseInfoLength);
+	memcpy(hdr->DataBufferOffset + (void*)hdr, dxferp, hdr->DataTransferLength);
+		
+	hdr->PathId = 0;
+	hdr->TargetId = 1;
+	hdr->Lun = 0;
+	hdr->CdbLength = UTP_CMD_SIZE;
+	hdr->Cdb = (unsigned char *)cmd->data;
+	hdr->DataIn = SCSI_IOCTL_DATA_OUT;
+	hdr->TimeOutValue = CMD_TIMEOUT;
+#else
 	struct sg_io_hdr sgio_hdr;
 	memset(&sgio_hdr, 0, sizeof(sgio_hdr));
 	sgio_hdr.sbp = sensebuf;
@@ -88,6 +127,7 @@ int send_cmd(int device_fd, struct utp_cmd *cmd, void *dxferp, int dxferp_len, u
 	sgio_hdr.dxfer_direction = SG_DXFER_TO_DEV;
 	sgio_hdr.dxfer_len = dxferp_len;
 	sgio_hdr.dxferp = dxferp;
+#endif
 
 	// Print CDB data
 	if (extra_info)
@@ -95,17 +135,25 @@ int send_cmd(int device_fd, struct utp_cmd *cmd, void *dxferp, int dxferp_len, u
 		int i;
 		for (i = 0; i < UTP_CMD_SIZE; i++)
 		{
+#ifdef WIN32
+			printf("Sent data %02d: 0x%02x\n", i, hdr.Cdb[i]);
+#else
 			printf("Sent data %02d: 0x%02x\n", i, sgio_hdr.cmdp[i]);
+#endif
 		}
 	}
 
 	// Call IOCTL
+#ifdef WIN32
+	ret = DeviceIoControl(device_fd, IOCTL_SCSI_PASS_THROUGH, hdr, totalBufferLength, NULL, 0, &junk, NULL);
+#else
 	ret = ioctl(device_fd, SG_IO, &sgio_hdr);
+#endif
 	if (ret < 0)
 	{
 		fprintf(stderr, "SG_IO ioctl error\n");
-		close(device_fd);
-		return 1;
+		CLOSE(device_fd);
+		goto cleanup;
 	}
 
 	// Print sense data
@@ -131,11 +179,16 @@ int send_cmd(int device_fd, struct utp_cmd *cmd, void *dxferp, int dxferp_len, u
 	if (sensebuf[UTP_REPLY_BYTE] == UTP_REPLY_EXIT)
 	{
 		fprintf(stderr, "UTP_REPLY_EXIT\n");
-		close(device_fd);
-		return 1;
+		CLOSE(device_fd);
+		goto cleanup;
 	}
 
-	return 0;
+	err = 0;
+cleanup:
+#ifdef WIN32
+	free(hdr);
+#endif
+	return err;
 }
 
 int main(int argc, char * argv[])
@@ -143,7 +196,7 @@ int main(int argc, char * argv[])
 	int c;
 	int ret;
 	int file_fd;
-	int device_fd;
+	FILE_HANDLE device_fd;
 	struct stat st;
 	char *command = NULL;
 	char *file_name = NULL;
@@ -217,7 +270,7 @@ int main(int argc, char * argv[])
 			total_read += data_read;
 		}
 
-		close(file_fd);
+		CLOSE(file_fd);
 
 		// Check that the whole file was read
 		if (total_read != st.st_size)
@@ -228,7 +281,11 @@ int main(int argc, char * argv[])
 	}
 
 	// Open device
+#ifdef WIN32
+	device_fd = CreateFile(device_name, GENERIC_READ, 0, 0, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, 0);
+#else
 	device_fd = open(device_name, O_RDWR);
+#endif
 	if (device_fd < 0)
 	{
 		fprintf(stderr, "Error opening device: %s\n", device_name);
@@ -305,7 +362,7 @@ int main(int argc, char * argv[])
 		}
 	}
 
-	close(device_fd);
+	CLOSE(device_fd);
 
 	return ret;
 }

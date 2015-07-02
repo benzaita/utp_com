@@ -1,4 +1,3 @@
-CC=gcc
 CFLAGS=-I. -Wall -O2
 DEPS=
 OBJ=utp_com.o
