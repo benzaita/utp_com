@@ -314,10 +314,11 @@ int main(int argc, char * argv[])
 	// Open device
 #ifdef WIN32
 	device_fd = CreateFile(device_name, GENERIC_READ | GENERIC_WRITE, 0, 0, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, 0);
+	if (device_fd == (FILE_HANDLE)-1)
 #else
 	device_fd = open(device_name, O_RDWR);
-#endif
 	if (device_fd < 0)
+#endif
 	{
 		fprintf(stderr, "Error opening device: %s\n", device_name);
 		return 1;
